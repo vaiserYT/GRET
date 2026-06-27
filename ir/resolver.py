@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Optional, TYPE_CHECKING
 
-from code.opcodes import Opcode, is_call
+from code.opcodes import Opcode, is_call, is_push
 
 if TYPE_CHECKING:
     from model.game import Game
@@ -111,6 +111,9 @@ class Resolver:
     """Bidirectional cross-reference index for a loaded Game."""
 
     def __init__(self) -> None:
+        # FUNC table index -> CODE entry ID (for script functions)
+        self.func_to_code: dict[int, int] = {}
+
         # code_id -> owner string label
         self.code_owner: dict[int, str] = {}
 
@@ -159,6 +162,7 @@ class Resolver:
 
     def build(self, game: Game) -> None:
         """Build all indexes from a loaded Game instance."""
+        self._build_func_to_code(game)
         self._resolve_object_references(game)
         self._resolve_room_references(game)
         self._resolve_code_ownership(game)
@@ -280,34 +284,105 @@ class Resolver:
             for str_id in entry.string_refs:
                 self.string_refs[str_id].append(code_id)
 
+    def _build_func_to_code(self, game: Game) -> None:
+        """Build FUNC table index -> CODE entry ID mapping.
+
+        A FUNC entry's code_offset matches a CODE entry's bytecode offset
+        when the function is a "primary" entry point (script, event, etc.).
+        Inner/anonymous functions have code_offsets within a parent CODE
+        entry's bytecode range but no exact offset match.
+        """
+        code_by_offset: dict[int, int] = {}
+        for cid, entry in game.code_entries.items():
+            code_by_offset[entry.offset] = cid
+
+        self.func_to_code = {}
+        for func_id in range(len(game.func_names)):
+            code_off = game.func_code_offsets[func_id] if func_id < len(game.func_code_offsets) else 0
+            if code_off > 0 and code_off in code_by_offset:
+                self.func_to_code[func_id] = code_by_offset[code_off]
+
     def _build_call_graph(self, game: Game) -> None:
         """Build call graph from CALL instructions.
 
-        func_id < CODE_COUNT means it's a CODE entry ID (script call).
-        func_id >= CODE_COUNT means it's a built-in function hash.
-        The instruction_type byte encodes additional call metadata
-        but does NOT reliably distinguish script vs built-in calls.
+        CALL instructions in bytecode use FUNC table indices.
+        func_to_code maps FUNC index -> CODE entry ID for scripts.
+        Functions without a CODE entry are built-in calls.
         """
-        code_count = len(game.code_entries)
+        func_count = len(game.func_names)
 
         for caller_code_id, entry in game.code_entries.items():
             for func_id, arg_count, raw_type in entry.calls:
-                if func_id < code_count:
-                    callee = game.code_entries.get(func_id)
-                    if callee is not None:
-                        self.callers[func_id].add(caller_code_id)
-                        self.callees[caller_code_id].add(func_id)
+                if func_id >= func_count:
+                    # Garbage/invalid func_id — skip
+                    continue
+                callee_code_id = self.func_to_code.get(func_id)
+                if callee_code_id is not None:
+                    self.callers[callee_code_id].add(caller_code_id)
+                    self.callees[caller_code_id].add(callee_code_id)
                 else:
                     self.builtin_calls[caller_code_id].append((func_id, arg_count))
 
     def _build_flag_refs(self, game: Game) -> None:
-        """Build flag read/write index."""
+        """Build flag read/write index from bytecode instructions.
+
+        Identifies flag access by detecting CALL instructions to functions
+        whose names match flag-related patterns (scr_flag_get, scr_flag_set,
+        scr_flag_get_ext, scr_flag_set_ext, etc.).
+
+        Flag index extraction from preceding PUSHI is attempted but may fail
+        for index values passed as variables. All detected accesses are
+        recorded; failed extractions use flag_id=-1.
+        """
+        flag_get_funcs: set[int] = set()
+        flag_set_funcs: set[int] = set()
+        for func_id, fname in enumerate(game.func_names):
+            if not fname:
+                continue
+            low = fname.lower()
+            if "flag_get" in low and "get" in low:
+                flag_get_funcs.add(func_id)
+            elif "flag_set" in low and "set" in low:
+                flag_set_funcs.add(func_id)
+            elif "flag" in low and "get" not in low and "set" not in low:
+                if low == "flag":
+                    continue
+                if "name" in low:
+                    continue
+                flag_get_funcs.add(func_id)
+
         for code_id, entry in game.code_entries.items():
-            for flag_id, is_write in entry.flag_refs:
+            instrs = entry.instructions
+            for i, instr in enumerate(instrs):
+                if not is_call(instr.opcode):
+                    continue
+                func_id = instr.value_func_id
+                is_write = func_id in flag_set_funcs
+                is_read = func_id in flag_get_funcs
+                if not is_write and not is_read:
+                    continue
+
+                flag_idx = -1
+                for j in range(i - 1, max(i - 5, -1), -1):
+                    prev = instrs[j]
+                    if prev.opcode == Opcode.PUSHI:
+                        flag_idx = prev.value_int
+                        break
+                    if prev.opcode == Opcode.PUSHSTR:
+                        try:
+                            flag_idx = int(prev.value_str)
+                        except (ValueError, TypeError):
+                            pass
+                        break
+                    if prev.opcode in (Opcode.PUSHENV, Opcode.POPENV, Opcode.PUSHBLTN):
+                        continue
+                    break
+
                 if is_write:
-                    self.flag_writes[flag_id].append(code_id)
+                    self.flag_writes[flag_idx].append(code_id)
                 else:
-                    self.flag_reads[flag_id].append(code_id)
+                    self.flag_reads[flag_idx].append(code_id)
+                entry.flag_refs.append((flag_idx, is_write))
 
     def _build_sprite_users(self, game: Game) -> None:
         """Build sprite usage index from object references."""

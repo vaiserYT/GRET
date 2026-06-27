@@ -88,6 +88,19 @@ def load_game(path: str | Path, show_progress: bool = True) -> Game:
         if "FUNC" in chunks:
             progress.update(main_task, description="[cyan]Parsing functions...")
             game.functions = parse_functions_gms2(reader, chunks["FUNC"], game.strings)
+            # Build func_names and func_code_offsets arrays from raw FUNC table
+            func_count = reader.read_uint32(chunks["FUNC"].offset)
+            game.func_names = [""] * func_count
+            game.func_code_offsets = [0] * func_count
+            for i in range(func_count):
+                off = chunks["FUNC"].offset + 4 + i * 12
+                if off + 12 > reader.size:
+                    break
+                name_id = reader.read_int32(off + 4)
+                code_off = reader.read_uint32(off + 8)
+                game.func_code_offsets[i] = code_off
+                if 0 <= name_id < len(game.strings):
+                    game.func_names[i] = game.strings[name_id]
         progress.advance(main_task)
 
         # VARI

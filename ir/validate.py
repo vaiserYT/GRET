@@ -189,7 +189,7 @@ def validate_rooms(game, resolver) -> list[ValidationIssue]:
 
     # Track unique error types for summary
     missing_cc_ids: set[int] = set()
-    zero_instance_rooms = 0
+    empty_room_names: list[str] = []
 
     for room_id, room in game.rooms.items():
         if room.creation_code_id >= 0:
@@ -198,18 +198,19 @@ def validate_rooms(game, resolver) -> list[ValidationIssue]:
 
         total_instances = len(room.instances) + sum(len(l.instances) for l in room.layers)
         if total_instances == 0:
-            zero_instance_rooms += 1
+            empty_room_names.append(room.name)
 
     if missing_cc_ids:
         issues.append(ValidationIssue("error", "room",
             f"{len(missing_cc_ids)} unique creation_code_ids not in code_entries: "
             f"{sorted(missing_cc_ids)} — GMS2.3 uses different encoding"))
-    if zero_instance_rooms:
-        issues.append(ValidationIssue("warning", "room",
-            f"{zero_instance_rooms}/{len(game.rooms)} rooms have zero instances parsed "
-            f"(GMS2.3 layer format — instances stored in layers, not top-level)"))
+    if empty_room_names:
+        issues.append(ValidationIssue("info", "room",
+            f"{len(empty_room_names)} rooms have zero instances: "
+            f"{', '.join(empty_room_names)}"))
 
-        # Check instance object references
+    # Check instance object references
+    for room in game.rooms.values():
         for inst in room.instances:
             obj = game.object_by_id(inst.object_id)
             if obj is None:
@@ -490,8 +491,8 @@ def validate_flags(game, resolver) -> list[ValidationIssue]:
     """Validate flag read/write indexes."""
     issues: list[ValidationIssue] = []
 
-    all_write_flags = set(resolver.flag_writes.keys())
-    all_read_flags = set(resolver.flag_reads.keys())
+    all_write_flags = {k for k in resolver.flag_writes.keys() if k >= 0}
+    all_read_flags = {k for k in resolver.flag_reads.keys() if k >= 0}
     read_only = all_read_flags - all_write_flags
     if read_only:
         sample = sorted(read_only)[:20]
@@ -501,9 +502,13 @@ def validate_flags(game, resolver) -> list[ValidationIssue]:
 
     total_flag_reads = sum(len(v) for v in resolver.flag_reads.values())
     total_flag_writes = sum(len(v) for v in resolver.flag_writes.values())
+    unknown_reads = sum(len(v) for k, v in resolver.flag_reads.items() if k < 0)
+    known_flags = len(all_read_flags | all_write_flags)
+    has_unknown = 1 if (any(k < 0 for k in resolver.flag_reads) or any(k < 0 for k in resolver.flag_writes)) else 0
     issues.append(ValidationIssue("info", "flag",
         f"Flag refs: {total_flag_reads} reads, {total_flag_writes} writes across "
-        f"{len(all_write_flags | all_read_flags)} unique flags"))
+        f"{known_flags} known flags"
+        f"{f' + {unknown_reads} unknown-index reads' if unknown_reads else ''}"))
 
     return issues
 

@@ -65,6 +65,8 @@ class Game:
         self.fonts: dict[int, FontDef] = {}
         self.variables: dict[int, VariableDef] = {}
         self.functions: dict[str, FunctionDef] = {}
+        self.func_names: list[str] = []  # func_id -> function name from FUNC table
+        self.func_code_offsets: list[int] = []  # func_id -> bytecode offset in CODE chunk
         self.code_entries: dict[int, CodeEntry] = {}
         self.code_offsets: dict[int, int] = {}
 

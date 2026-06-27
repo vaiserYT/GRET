@@ -31,6 +31,7 @@ class ResourceGraph:
         self._build_room_graph()
         self._build_call_graph()
         self._build_object_graph()
+        self._build_flag_graph()
 
     def _build_room_graph(self) -> None:
         """Build room graph from resolver's room_transitions.
@@ -124,6 +125,26 @@ class ResourceGraph:
             spr_node = f"spr_{sprite.id}"
             self.object.add_node(spr_node, id=sprite.id, name=sprite.name, type="sprite")
             self.object.add_edge(obj_node, spr_node, relation="uses_sprite")
+
+    def _build_flag_graph(self) -> None:
+        """Build flag graph from resolver's flag read/write indexes.
+
+        Nodes are flag indices, edges connect flag readers/writers to flags.
+        """
+        res = self.resolver
+        for flag_id in set(res.flag_reads.keys()) | set(res.flag_writes.keys()):
+            label = f"flag[{flag_id}]" if flag_id >= 0 else "flag[?]"
+            self.flag.add_node(flag_id, name=label, type="flag")
+        for flag_id, readers in res.flag_reads.items():
+            for code_id in readers:
+                node = f"code_{code_id}"
+                self.flag.add_node(node, id=code_id, type="code")
+                self.flag.add_edge(node, flag_id, type="reads")
+        for flag_id, writers in res.flag_writes.items():
+            for code_id in writers:
+                node = f"code_{code_id}"
+                self.flag.add_node(node, id=code_id, type="code")
+                self.flag.add_edge(flag_id, node, type="writes")
 
     def unreachable_rooms(self) -> set[int]:
         if not self.room.nodes():
