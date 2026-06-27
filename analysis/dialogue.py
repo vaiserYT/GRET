@@ -15,7 +15,7 @@ class DialogueAnalyzer:
         self.dialogue_refs: dict[int, list[tuple[str, int]]] = defaultdict(list)
         self.dialogue_funcs: set[str] = set()
 
-    def analyze(self) -> None:
+    def analyze(self, progress_callback=None) -> None:
         for name, func in self.game.functions.items():
             if "dialogue" in name.lower() or name in {
                 "scr_Dialogue", "scr_Dialogue_String", "scr_Dialogue_Name",
@@ -23,16 +23,17 @@ class DialogueAnalyzer:
             }:
                 self.dialogue_funcs.add(name)
 
-        for code_id, entry in self.game.code_entries.items():
+        entries = list(self.game.code_entries.items())
+        total = len(entries)
+        for idx, (code_id, entry) in enumerate(entries):
+            if progress_callback and idx % max(1, total // 20) == 0:
+                progress_callback(idx, total, "Scanning code for dialogue")
             owner = self.resolver.owner_of(code_id)
-            # Collect all PUSHSTR strings
             for instr in entry.instructions:
                 if instr.opcode == Opcode.PUSHSTR and instr.value_str_id >= 0:
                     s = self.game.string(instr.value_str_id)
                     if s and len(s) > 3:
                         self.dialogue_strings[instr.value_str_id] = s
-
-            # Find dialogue function calls with preceding PUSHSTR args
             for i, instr in enumerate(entry.instructions):
                 if instr.opcode not in (Opcode.CALL, Opcode.CALLV, Opcode.CALLVN):
                     continue
@@ -40,6 +41,8 @@ class DialogueAnalyzer:
                     str_ids = self._find_preceding_strings(entry.instructions, i)
                     for str_id in str_ids:
                         self.dialogue_refs[str_id].append((owner or f"code_{code_id}", i))
+        if progress_callback:
+            progress_callback(total, total, "Dialogue analysis done")
 
     def _is_dialogue_call(self, instr, code_id: int) -> bool:
         func_id = instr.value_func_id

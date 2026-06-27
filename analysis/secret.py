@@ -1,25 +1,39 @@
-"""SecretFinder: detect suspicious/hidden resources using resolver + graph."""
+"""SecretFinder: confidence-based suspicious resource detection.
+
+Uses multiple independent heuristics and aggregates them into a 0-100
+confidence score. Never classifies something as "secret" solely because
+it is absent from rooms.
+"""
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
-from analysis.objects import ObjectAnalyzer
+from analysis.objects import RuntimeUsageAnalyzer, ObjectState
 from analysis.dialogue import DialogueAnalyzer
-from code.opcodes import Opcode
+from code.opcodes import Opcode, is_call
 
 
 @dataclass
 class SuspiciousItem:
     name: str
     resource_type: str
-    score: int
+    confidence: int
     reasons: list[str] = field(default_factory=list)
+    evidence_for: list[str] = field(default_factory=list)
+    evidence_against: list[str] = field(default_factory=list)
     details: str = ""
 
     def __lt__(self, other: SuspiciousItem) -> bool:
-        return self.score > other.score
+        return self.confidence > other.confidence
+
+
+SUSPICIOUS_NAMES = [
+    "test", "debug", "proto", "wip", "placeholder", "tmp", "temp",
+    "sandbox", "unused", "legacy", "old_", "backup", "deprecated",
+    "hidden", "secret", "easteregg", "bonus", "beta", "unimplemented",
+]
 
 
 class SecretFinder:
@@ -28,124 +42,234 @@ class SecretFinder:
         self.graph = graph
         self.resolver = game.resolver
         self.items: list[SuspiciousItem] = []
+        self._obj_analyzer: Optional[RuntimeUsageAnalyzer] = None
 
-    def find_all(self) -> list[SuspiciousItem]:
+    def analyze_objects(self, progress_callback=None) -> RuntimeUsageAnalyzer:
+        if self._obj_analyzer is None:
+            a = RuntimeUsageAnalyzer(self.game)
+            a.analyze(progress_callback=progress_callback)
+            self._obj_analyzer = a
+        return self._obj_analyzer
+
+    def find_all(self, progress_callback=None) -> list[SuspiciousItem]:
         self.items.clear()
-        self._find_dead_objects()
-        self._find_dead_rooms()
-        self._find_dead_scripts()
-        self._find_unused_sprites()
-        self._find_unused_sounds()
-        self._find_unused_dialogue()
-        self._find_empty_objects()
-        self._find_orphan_resources()
+        phases = [
+            ("objects", self._find_suspicious_objects),
+            ("rooms", self._find_suspicious_rooms),
+            ("scripts", self._find_suspicious_scripts),
+            ("sprites", self._find_suspicious_sprites),
+            ("sounds", self._find_suspicious_sounds),
+            ("dialogue", self._find_suspicious_dialogue),
+            ("empty objects", self._find_empty_objects),
+            ("orphan resources", self._find_orphan_resources),
+        ]
+        total = len(phases)
+        for i, (name, method) in enumerate(phases):
+            if progress_callback:
+                progress_callback(i, total, f"Analyzing {name}")
+            method()
+        if progress_callback:
+            progress_callback(total, total, "Sorting results")
         self.items.sort()
         return self.items
 
-    def _find_dead_objects(self) -> None:
-        obj_analyzer = ObjectAnalyzer(self.game)
-        obj_analyzer.analyze()
-        dead = obj_analyzer.dead_objects
-        orphan = obj_analyzer.orphan_objects
+    def _confidence(self, evidence_for: list[str], evidence_against: list[str]) -> int:
+        score = 0
+        score += min(len(evidence_for) * 15, 70)
+        score -= min(len(evidence_against) * 20, 60)
+        score = max(0, min(100, score))
+        if not evidence_against and evidence_for:
+            score = max(score, 40)
+        return score
 
-        for obj_name in dead:
-            obj = next((o for o in self.game.objects.values() if o.name == obj_name), None)
-            if not obj:
-                continue
-            score = 40
-            reasons = []
-            if obj.has_step:
-                score += 15
-                reasons.append("Has Step event but never instantiated")
-            if obj.has_draw:
-                score += 10
-                reasons.append("Has Draw event but never instantiated")
-            if obj.has_create:
-                score += 5
-                reasons.append("Has Create event but never instantiated")
-            if obj.has_alarm:
-                score += 10
-                reasons.append("Has Alarm event but never instantiated")
-            if obj.sprite_index >= 0:
-                score += 5
+    def _find_suspicious_objects(self) -> None:
+        obj_an = self.analyze_objects()
+        for obj_info in obj_an.classified_objects():
+            name = obj_info["name"]
+            states = obj_info["states"]
+
+            evidence_for: list[str] = []
+            evidence_against: list[str] = []
+
+            if "unused" in states or "likely unused" in states:
+                evidence_for.append("never instantiated")
+
+            if ObjectState.BYTECODE_REFERENCED.name.lower() in str(states).lower():
+                evidence_against.append("referenced in bytecode")
+            if ObjectState.ROOM_PLACED.name.lower() in str(states).lower():
+                evidence_against.append("placed in room")
+            if ObjectState.CREATED_DYNAMICALLY.name.lower() in str(states).lower():
+                evidence_against.append("dynamically created")
+            if ObjectState.INHERITED.name.lower() in str(states).lower():
+                evidence_against.append("inherits from parent")
+            if ObjectState.PARENT_OF.name.lower() in str(states).lower():
+                evidence_against.append("is a parent object")
+            if ObjectState.STRING_REFERENCED.name.lower() in str(states).lower():
+                evidence_against.append("referenced by strings")
+            if ObjectState.COLLISION_REFERENCED.name.lower() in str(states).lower():
+                evidence_against.append("in collision events")
+            if ObjectState.CREATION_CODE_REFERENCED.name.lower() in str(states).lower():
+                evidence_against.append("in creation code")
+            if ObjectState.WITH_REFERENCED.name.lower() in str(states).lower():
+                evidence_against.append("with() reference")
+            if ObjectState.ASSET_GET_REFERENCED.name.lower() in str(states).lower():
+                evidence_against.append("asset_get_index reference")
+            if ObjectState.FUNCTION_CREATED.name.lower() in str(states).lower():
+                evidence_against.append("creation function call")
+
+            obj = next((o for o in self.game.objects.values() if o.name == name), None)
+            if obj:
+                if obj.event_count > 5:
+                    evidence_for.append(f"complex object ({obj.event_count} events)")
+                if "controller" in name.lower() or "ctrl" in name.lower():
+                    evidence_for.append("controller naming pattern")
+
+            low = name.lower()
+            for pat in SUSPICIOUS_NAMES:
+                if pat in low:
+                    evidence_for.append(f"suspicious name pattern: '{pat}'")
+                    break
+
+            if obj and obj.sprite_index >= 0:
                 sprite = self.game.sprite_by_id(obj.sprite_index)
-                reasons.append(f"References sprite '{sprite.name if sprite else '?'}' but never used")
-            if obj.event_count > 3:
-                score += 10
-                reasons.append(f"Has {obj.event_count} events but never instantiated (complex dead object)")
-            if obj_name in orphan:
-                score += 15
-                reasons.append("Not placed, not created dynamically, not inherited")
-            details = obj.event_summary() if obj.has_any_event else "Empty object"
+                if sprite and not any(
+                    o.sprite_index == obj.sprite_index
+                    for o in self.game.objects.values()
+                    if o.id != obj.id and o.name != name
+                ):
+                    evidence_for.append("unique sprite (not shared)")
+
+            if not evidence_for and not evidence_against:
+                continue
+
+            if not evidence_against and evidence_for:
+                evidence_for.append("no evidence of runtime use")
+
+            conf = self._confidence(evidence_for, evidence_against)
+            if conf < 20:
+                continue
+
             self.items.append(SuspiciousItem(
-                name=obj_name, resource_type="OBJECT", score=score,
-                reasons=reasons[:5], details=details,
+                name=name, resource_type="OBJECT", confidence=conf,
+                reasons=evidence_for[:5],
+                evidence_for=evidence_for[:5],
+                evidence_against=evidence_against[:5],
+                details=f"States: {', '.join(states[:5])}",
             ))
 
-    def _find_dead_rooms(self) -> None:
+    def _find_suspicious_rooms(self) -> None:
         unreachable_ids = self.graph.unreachable_rooms()
         for room_id in sorted(unreachable_ids):
             room = self.game.room_by_id(room_id)
             if not room:
                 continue
-            score = 50
-            reasons = ["No incoming room transitions (potentially unreachable)"]
+            evidence_for: list[str] = []
+            evidence_against: list[str] = []
+
+            evidence_for.append("no incoming room transitions")
+
             if not room.instances:
-                score += 15
-                reasons.append("Empty room (no instances placed)")
-            obj_count = room.object_count
-            if obj_count > 20:
-                score += 10
-                reasons.append(f"Has {obj_count} instances but no incoming path")
+                evidence_for.append("empty room (zero instances)")
+
+            obj_count = len(room.instances)
+            if obj_count > 10:
+                evidence_for.append(f"has {obj_count} instances but unreachable")
+
+            low = room.name.lower()
+            for pat in SUSPICIOUS_NAMES:
+                if pat in low:
+                    evidence_for.append(f"suspicious name: '{pat}'")
+                    break
+
+            has_outgoing = any(
+                self.graph.room.has_edge(room_id, t)
+                for t in range(300)
+            )
+            if has_outgoing:
+                evidence_against.append("has outgoing transitions")
+
+            conf = self._confidence(evidence_for, evidence_against)
+            if conf < 25:
+                continue
+
             self.items.append(SuspiciousItem(
-                name=room.name, resource_type="ROOM", score=score,
-                reasons=reasons,
+                name=room.name, resource_type="ROOM", confidence=conf,
+                reasons=evidence_for[:5],
+                evidence_for=evidence_for[:5],
+                evidence_against=evidence_against[:5],
                 details=f"Room has {obj_count} instances, {len(room.views)} views",
             ))
 
-    def _find_dead_scripts(self) -> None:
-        called_funcs: set[str] = set()
-        for caller_id, callees in self.resolver.callees.items():
+    def _find_suspicious_scripts(self) -> None:
+        obj_an = self.analyze_objects()
+        alive_objects = obj_an.alive_objects()
+        used_funcs: set[str] = set()
+
+        for cid, callees in self.resolver.callees.items():
             for callee_id in callees:
                 entry = self.game.code_entries.get(callee_id)
-                if entry and entry.name.startswith("gml_Script_"):
-                    script_name = entry.name[len("gml_Script_"):]
-                    called_funcs.add(script_name)
+                if entry and entry.name:
+                    used_funcs.add(entry.name)
 
-        dead_scripts: set[str] = set()
         for name, script in self.game.scripts.items():
             func_name = f"gml_Script_{script.name}"
-            if func_name not in called_funcs and script.name not in called_funcs:
-                dead_scripts.add(script.name)
+            if func_name in used_funcs:
+                continue
 
-        for script_name in sorted(dead_scripts):
-            score = 35
-            reasons = ["Script never called from any code path"]
+            evidence_for: list[str] = []
+            evidence_against: list[str] = []
+            evidence_for.append("script never called")
+
+            low = script.name.lower()
+            for pat in SUSPICIOUS_NAMES:
+                if pat in low:
+                    evidence_for.append(f"suspicious name: '{pat}'")
+                    break
+
+            conf = self._confidence(evidence_for, evidence_against)
+            if conf < 25:
+                continue
             self.items.append(SuspiciousItem(
-                name=script_name, resource_type="SCRIPT", score=score, reasons=reasons,
+                name=script.name, resource_type="SCRIPT", confidence=conf,
+                reasons=evidence_for[:5], evidence_for=evidence_for[:5],
+                evidence_against=evidence_against[:5],
             ))
 
-    def _find_unused_sprites(self) -> None:
-        used_sprites: set[str] = set()
+    def _find_suspicious_sprites(self) -> None:
+        used_sprites: set[int] = set()
         for obj in self.game.objects.values():
             if obj.sprite_index >= 0:
-                sprite = self.game.sprite_by_id(obj.sprite_index)
-                if sprite:
-                    used_sprites.add(sprite.name)
+                used_sprites.add(obj.sprite_index)
 
-        all_sprites = {s.name for s in self.game.sprites.values()}
-        unused = all_sprites - used_sprites
-        for sprite_name in sorted(unused)[:200]:
+        for sprite in self.game.sprites.values():
+            if sprite.id in used_sprites:
+                continue
+            evidence_for: list[str] = []
+            evidence_against: list[str] = []
+
+            evidence_for.append("sprite not assigned to any object")
+
+            low = sprite.name.lower()
+            for pat in SUSPICIOUS_NAMES:
+                if pat in low:
+                    evidence_for.append(f"suspicious name: '{pat}'")
+                    break
+
+            conf = self._confidence(evidence_for, evidence_against)
+            if conf < 10:
+                continue
             self.items.append(SuspiciousItem(
-                name=sprite_name, resource_type="SPRITE", score=10,
-                reasons=["Sprite not assigned to any object"],
+                name=sprite.name, resource_type="SPRITE", confidence=conf,
+                reasons=evidence_for[:5],
+                evidence_for=evidence_for[:5],
+                evidence_against=evidence_against[:5],
             ))
 
-    def _find_unused_sounds(self) -> None:
+    def _find_suspicious_sounds(self) -> None:
         audio_func_ids: set[int] = set()
-        for name, func in self.game.functions.items():
-            if "audio_play" in name:
-                audio_func_ids.add(func.id)
+        for func_id, fname in enumerate(self.game.func_names):
+            if fname and "audio_play" in fname.lower():
+                audio_func_ids.add(func_id)
 
         played_sounds: set[str] = set()
         for code_id, entry in self.game.code_entries.items():
@@ -154,39 +278,76 @@ class SecretFinder:
                     for instr in entry.instructions:
                         if instr.opcode == Opcode.PUSHSTR and instr.value_str_id >= 0:
                             s = self.game.string(instr.value_str_id)
-                            sound = next((sd for sd in self.game.sounds.values() if sd.name == s), None)
+                            sound = next(
+                                (sd for sd in self.game.sounds.values() if sd.name == s),
+                                None,
+                            )
                             if sound:
                                 played_sounds.add(s)
 
         all_sounds = {s.name for s in self.game.sounds.values()}
         unused = all_sounds - played_sounds
-        for sound_name in sorted(unused)[:200]:
+        for sound_name in sorted(unused)[:300]:
+            evidence_for: list[str] = []
+            evidence_against: list[str] = []
+            evidence_for.append("sound never played via audio_play_sound")
+            low = sound_name.lower()
+            for pat in SUSPICIOUS_NAMES:
+                if pat in low:
+                    evidence_for.append(f"suspicious name: '{pat}'")
+                    break
+            conf = self._confidence(evidence_for, evidence_against)
+            if conf < 10:
+                continue
             self.items.append(SuspiciousItem(
-                name=sound_name, resource_type="SOUND", score=10,
-                reasons=["Sound never played via audio_play_sound"],
+                name=sound_name, resource_type="SOUND", confidence=conf,
+                reasons=evidence_for[:5],
+                evidence_for=evidence_for[:5],
+                evidence_against=evidence_against[:5],
             ))
 
-    def _find_unused_dialogue(self) -> None:
+    def _find_suspicious_dialogue(self) -> None:
         dia = DialogueAnalyzer(self.game)
         dia.analyze()
         for str_id, text in dia.unused_dialogue():
             if len(text) < 5:
                 continue
-            preview = text[:80] + "..." if len(text) > 80 else text
+            low = text.lower()
+            evidence_for: list[str] = []
+            evidence_against: list[str] = []
+            evidence_for.append("dialogue string never referenced")
             score = 20 + min(len(text), 20)
+            for pat in ["secret", "hidden", "easter egg", "bonus", "debug"]:
+                if pat in low:
+                    evidence_for.append(f"content hint: '{pat}'")
+                    score += 15
+                    break
+            preview = text[:80] + "..." if len(text) > 80 else text
+            conf = min(score, 70)
+            if conf < 15:
+                continue
             self.items.append(SuspiciousItem(
-                name=f"str[{str_id}]", resource_type="STRING", score=score,
-                reasons=["Dialogue string never referenced by any dialogue function"],
+                name=f"str[{str_id}]", resource_type="STRING", confidence=conf,
+                reasons=evidence_for[:5],
+                evidence_for=evidence_for[:5],
+                evidence_against=evidence_against[:5],
                 details=f'"{preview}"',
             ))
 
     def _find_empty_objects(self) -> None:
         for obj_id, obj in self.game.objects.items():
-            if not obj.has_any_event:
-                self.items.append(SuspiciousItem(
-                    name=obj.name, resource_type="OBJECT", score=5,
-                    reasons=["Object has no events"],
-                ))
+            if obj.has_any_event:
+                continue
+            evidence_for: list[str] = ["object has no events"]
+            obj_an = self.analyze_objects()
+            if obj_an.is_alive(obj.name):
+                continue
+            self.items.append(SuspiciousItem(
+                name=obj.name, resource_type="OBJECT", confidence=15,
+                reasons=evidence_for[:5],
+                evidence_for=evidence_for[:5],
+                evidence_against=[],
+            ))
 
     def _find_orphan_resources(self) -> None:
         resource_refs: dict[str, set[str]] = defaultdict(set)
@@ -219,10 +380,12 @@ class SecretFinder:
 
         for name, rtype in all_resources.items():
             if name not in resource_refs:
-                score = 15 if rtype in ("OBJECT", "ROOM") else 8
+                conf = 15 if rtype in ("OBJECT", "ROOM") else 8
                 self.items.append(SuspiciousItem(
-                    name=name, resource_type=rtype, score=score,
+                    name=name, resource_type=rtype, confidence=conf,
                     reasons=[f"{rtype} has zero incoming references (orphan)"],
+                    evidence_for=[f"orphan {rtype}"],
+                    evidence_against=[],
                 ))
 
     def top_suspicious(self, limit: int = 100) -> list[SuspiciousItem]:

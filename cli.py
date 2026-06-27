@@ -9,6 +9,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 from rich.syntax import Syntax
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
 from binary.all_chunks import load_game
 from ir.graph import ResourceGraph
@@ -18,6 +19,17 @@ from ir.validate import validate_all, print_validation_results
 
 
 console = Console()
+
+
+def _progress_bar(description="Working..."):
+    return Progress(
+        SpinnerColumn(spinner_name="dots"),
+        TextColumn("{task.description}"),
+        BarColumn(),
+        TextColumn("{task.percentage:>3.0f}%"),
+        console=console,
+        transient=True,
+    )
 
 
 def cmd_load(path: Path) -> tuple:
@@ -43,8 +55,11 @@ def cmd_index(game_path: Path) -> None:
 
 def cmd_analyze(game_path: Path) -> None:
     game, graph, engine = cmd_load(game_path)
-    console.print("\n[bold]Running secret finder...[/]")
-    secrets = engine.hidden_resources()
+    with _progress_bar("Running full analysis...") as progress:
+        task = progress.add_task("Analyzing objects...", total=8)
+        def cb(c, t, msg):
+            progress.update(task, completed=c, total=t, description=msg)
+        secrets = engine.hidden_resources(on_progress=cb)
     table = Table(title="Top Suspicious Items")
     table.add_column("Score", style="red", no_wrap=True)
     table.add_column("Type", style="cyan")
@@ -55,7 +70,7 @@ def cmd_analyze(game_path: Path) -> None:
         reasons = "; ".join(item.reasons[:2])
         if len(item.reasons) > 2:
             reasons += f" (+{len(item.reasons)-2})"
-        table.add_row(str(item.score), item.resource_type, item.name, reasons)
+        table.add_row(str(item.confidence), item.resource_type, item.name, reasons)
 
     console.print(table)
     console.print(f"\n[bold]Total suspicious:[/] {len(secrets)}")
@@ -69,7 +84,11 @@ def cmd_why_object(args: list[str], game, graph, engine) -> None:
         console.print("[red]Usage: why <object_name>[/]")
         return
     name = args[0]
-    info = engine.why_object(name)
+    with _progress_bar("Analyzing object usage...") as progress:
+        task = progress.add_task("Analyzing runtime usage...", total=11)
+        def cb(c, t, msg):
+            progress.update(task, completed=c, total=t, description=msg)
+        info = engine.why_object(name, on_progress=cb)
     if "error" in info:
         console.print(f"[red]{info['error']}[/]")
         return
@@ -108,7 +127,11 @@ def cmd_trace(args: list[str], game, graph, engine) -> None:
     if not args:
         console.print("[red]Usage: trace <pattern>[/]")
         return
-    results = engine.trace(args[0])
+    with _progress_bar("Searching all resources...") as progress:
+        task = progress.add_task("Analyzing objects...", total=6)
+        def cb(c, t, msg):
+            progress.update(task, completed=c, total=t, description=msg)
+        results = engine.trace(args[0], on_progress=cb)
     if not results:
         console.print(f"[yellow]No results for '{args[0]}'[/]")
         return
@@ -125,13 +148,25 @@ def cmd_who_uses(args: list[str], game, graph, engine) -> None:
     if not args:
         console.print("[red]Usage: who_uses <resource_name>[/]")
         return
-    users = engine.who_uses(args[0])
-    if not users:
+    with _progress_bar("Finding references...") as progress:
+        task = progress.add_task("Analyzing...", total=4)
+        def cb(c, t, msg):
+            progress.update(task, completed=c, total=t, description=msg)
+        result = engine.who_uses(args[0], on_progress=cb)
+    total = sum(len(v) for v in result.values())
+    if total == 0:
         console.print(f"[yellow]No users found for '{args[0]}'[/]")
         return
-    console.print(f"[green]Users of '{args[0]}':[/]")
-    for u in users:
-        console.print(f"  - {u}")
+    console.print(f"[green]Users of '{args[0]}' ({total}):[/]")
+    for category, items in result.items():
+        if not items:
+            continue
+        label = category.replace("_", " ").title()
+        console.print(f"  [cyan]{label}:[/]")
+        for item in items[:10]:
+            console.print(f"    - {item}")
+        if len(items) > 10:
+            console.print(f"    ... and {len(items) - 10} more")
 
 
 def cmd_flag(args: list[str], game, graph, engine) -> None:
@@ -183,14 +218,24 @@ def cmd_unreachable(game, graph, engine) -> None:
     if len(rooms) > 50:
         console.print(f"  ... and {len(rooms) - 50} more")
 
-    dialogue = engine.unreachable_dialogue()
+    with _progress_bar("Analyzing dialogue...") as progress:
+        task = progress.add_task("Scanning for unused dialogue...", total=None)
+        def cb1(c, t, msg):
+            if task.total is None and t > 0:
+                progress.update(task, total=t)
+            progress.update(task, completed=c, description=msg)
+        dialogue = engine.unreachable_dialogue(on_progress=cb1)
     console.print(f"\n[bold yellow]Unused Dialogue ({len(dialogue)}):[/]")
     for sid, text in dialogue[:30]:
         console.print(f"  - {sid}: \"{text}\"")
     if len(dialogue) > 30:
         console.print(f"  ... and {len(dialogue) - 30} more")
 
-    dead = engine.dead_objects()
+    with _progress_bar("Analyzing dead objects...") as progress:
+        task = progress.add_task("Scanning object usage...", total=11)
+        def cb2(c, t, msg):
+            progress.update(task, completed=c, total=t, description=msg)
+        dead = engine.dead_objects(on_progress=cb2)
     console.print(f"\n[bold yellow]Dead Objects ({len(dead)}):[/]")
     for d in dead[:50]:
         console.print(f"  - {d}")
@@ -199,7 +244,11 @@ def cmd_unreachable(game, graph, engine) -> None:
 
 
 def cmd_secret(game, graph, engine) -> None:
-    secrets = engine.hidden_resources()
+    with _progress_bar("Finding hidden resources...") as progress:
+        task = progress.add_task("Analyzing objects...", total=8)
+        def cb(c, t, msg):
+            progress.update(task, completed=c, total=t, description=msg)
+        secrets = engine.hidden_resources(on_progress=cb)
     table = Table(title=f"Hidden Resources / Secrets ({len(secrets)} total)")
     table.add_column("Score", style="red", no_wrap=True)
     table.add_column("Type", style="cyan")
@@ -210,7 +259,7 @@ def cmd_secret(game, graph, engine) -> None:
     for item in secrets[:100]:
         reasons = "; ".join(item.reasons[:2])
         details = item.details[:60] if item.details else ""
-        table.add_row(str(item.score), item.resource_type, item.name, reasons, details)
+        table.add_row(str(item.confidence), item.resource_type, item.name, reasons, details)
 
     console.print(table)
 
@@ -219,7 +268,11 @@ def cmd_search(args: list[str], game, graph, engine) -> None:
     if not args:
         console.print("[red]Usage: search <pattern>[/]")
         return
-    results = engine.search(args[0])
+    with _progress_bar("Searching...") as progress:
+        task = progress.add_task("Scanning resources...", total=6)
+        def cb(c, t, msg):
+            progress.update(task, completed=c, total=t, description=msg)
+        results = engine.search(args[0], on_progress=cb)
     if not results:
         console.print(f"[yellow]No matches for '{args[0]}'[/]")
         return
