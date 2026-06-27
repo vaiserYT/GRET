@@ -340,12 +340,15 @@ class Resolver:
             if not fname:
                 continue
             low = fname.lower()
-            if "flag_get" in low and "get" in low:
+            # Pattern: flag_get or flagname_get (ext variants, typed variants)
+            if "_flag_get" in low or low.startswith("flag_get") or low == "flag_get":
                 flag_get_funcs.add(func_id)
-            elif "flag_set" in low and "set" in low:
+            # Pattern: flag_set or flagname_set
+            if "_flag_set" in low or low.startswith("flag_set") or low == "flag_set":
                 flag_set_funcs.add(func_id)
-            elif "flag" in low and "get" not in low and "set" not in low:
-                if low == "flag":
+            # Generic "flag" in name — treat as read unless set pattern matched
+            if "flag" in low and func_id not in flag_set_funcs and func_id not in flag_get_funcs:
+                if low in ("flag", "flag_name", "flagname"):
                     continue
                 if "name" in low:
                     continue

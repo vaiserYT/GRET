@@ -1,327 +1,178 @@
-"""QueryEngine: high-level query interface over resolver + ResourceGraph."""
+"""QueryEngine: thin graph query wrapper over SemanticReferenceGraph.
+
+No duplicated analysis. No independent bytecode scanning.
+Every method is a pure graph traversal against the single unified graph.
+"""
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any, Callable, Optional
 
-from analysis.objects import RuntimeUsageAnalyzer
-from analysis.dialogue import DialogueAnalyzer
-from analysis.secret import SecretFinder, SuspiciousItem
-from code.opcodes import Opcode
+from ir.semantic_graph import (
+    SemanticReferenceGraph,
+    SuspiciousItem,
+    TraceNode,
+    NT_OBJECT, NT_ROOM, NT_SPRITE, NT_CODE, NT_FLAG,
+    NT_INSTANCE, NT_STRING, NT_SOUND, NT_FUNCTION, NT_SCRIPT,
+    READS_FLAG, WRITES_FLAG, CREATES, HAS_EVENT, HAS_CREATION_CODE,
+    IS_INSTANCE_OF, CONTAINS, CONNECTED_TO, REFERENCES,
+    REFERENCES_SOUND, CALLS, OWNS, ENTRY_POINT,
+)
 
 
 ProgressCB = Optional[Callable[[int, int, str], None]]
 
 
 class QueryEngine:
-    def __init__(self, game, graph) -> None:
+    """Minimal stateless query interface over the pre-built graph."""
+
+    def __init__(self, game, graph: SemanticReferenceGraph) -> None:
         self.game = game
         self.graph = graph
-        self.resolver = game.resolver
-        self.secret_finder = SecretFinder(game, graph)
-        self.object_analyzer = RuntimeUsageAnalyzer(game)
-        self.dialogue_analyzer = DialogueAnalyzer(game)
+
+    def _done(self, cb: ProgressCB, msg: str = "Done") -> None:
+        if cb:
+            cb(1, 1, msg)
+
+    # ── TRACE ────────────────────────────────────────────────────────
+
+    def trace(self, pattern: str, on_progress: ProgressCB = None) -> list[dict[str, Any]]:
+        """Semantic graph traversal showing the relationship chain."""
+        raw = self.graph.trace(pattern)
+        results = []
+        for tn in raw:
+            chains = []
+            for rel, target, tname in tn.edges[:12]:
+                direction = "\u2190" if rel.startswith("<--") else "\u2192"
+                r = rel.replace("<--", "")
+                chains.append(f"{direction} {r} {tname}")
+            results.append({
+                "type": tn.type,
+                "name": tn.name,
+                "node_id": tn.node_id,
+                "summary": "; ".join(chains) if chains else "Isolated node",
+                "edge_count": len(tn.edges),
+            })
+        self._done(on_progress, "Trace complete")
+        return results[:100]
+
+    # ── WHO_USES ─────────────────────────────────────────────────────
+
+    def who_uses(self, resource_name: str, on_progress: ProgressCB = None) -> dict[str, list[str]]:
+        """Inverse graph query — grouped incoming references."""
+        result = self.graph.who_uses(resource_name)
+        self._done(on_progress, "Query complete")
+        return result
+
+    # ── WHY OBJECT ───────────────────────────────────────────────────
 
     def why_object(self, name: str, on_progress: ProgressCB = None) -> dict[str, Any]:
-        obj = next((o for o in self.game.objects.values() if o.name == name), None)
+        """Full semantic trace for a single object. Never crashes."""
+        try:
+            obj = next((o for o in self.game.objects.values() if o.name == name), None)
+        except Exception:
+            return {"error": f"Failed to search for object '{name}'"}
         if not obj:
             return {"error": f"Object '{name}' not found"}
 
-        if on_progress:
-            on_progress(0, 1, "Analyzing runtime usage")
-        self.object_analyzer.analyze(progress_callback=on_progress)
-        info = self.object_analyzer.object_analysis(name)
-        if "error" in info:
-            return info
+        node = f"obj_{obj.id}"
+        if not self.graph.G.has_node(node):
+            return {"error": f"Object '{name}' not in graph"}
 
-        if on_progress:
-            on_progress(1, 1, "Gathering room refs")
-        placed_in: list[str] = []
-        for room_id, instances in self.resolver.room_instances.items():
-            for inst in instances:
-                if inst.object_id == obj.id:
-                    room = self.game.room_by_id(room_id)
-                    if room:
-                        placed_in.append(f"{room.name} ({inst.x}, {inst.y})")
+        inc = self.graph.incoming(node)
+        out = self.graph.outgoing(node)
 
-        sprite = self.resolver.object_sprite.get(obj.id)
-        parent = self.resolver.object_parent.get(obj.id)
+        placed_in = []
+        created_by = []
+        for e in inc:
+            try:
+                if e.get("relation") == IS_INSTANCE_OF and e.get("type") == NT_INSTANCE:
+                    for src2, _, d2 in self.graph.G.in_edges(e["source"], data=True):
+                        if d2.get("relation") == CONTAINS:
+                            rname = self.graph.G.nodes[src2].get("name", src2)
+                            placed_in.append(rname)
+                if e.get("relation") == CREATES:
+                    created_by.append(f"{e.get('name', '?')} ({e.get('source', '?')})")
+            except Exception:
+                continue
 
-        incoming = set()
-        obj_node = f"obj_{obj.id}"
-        if self.graph.object.has_node(obj_node):
-            for pred in self.graph.object.predecessors(obj_node):
-                incoming.add(str(pred))
-        outgoing = set()
-        for succ in self.graph.object.successors(obj_node):
-            outgoing.add(str(succ))
+        sprite = None
+        parent = None
+        children = []
+        events = []
+        for e in out:
+            try:
+                if e.get("relation") == "uses_sprite":
+                    sprite = e.get("name")
+                if e.get("relation") == "inherits":
+                    parent = e.get("name")
+            except Exception:
+                continue
 
+        # Get event info from the object itself, not graph (more reliable)
+        try:
+            for ev in obj.events:
+                events.append((ev.event_type, ev.subtype))
+        except Exception:
+            pass
+
+        for e in inc:
+            try:
+                if e.get("relation") == "inherits":
+                    children.append(e.get("name", "?"))
+            except Exception:
+                continue
+
+        self._done(on_progress, "Analysis complete")
         return {
             "name": obj.name,
             "id": obj.id,
-            "sprite": sprite.name if sprite else None,
-            "parent": parent.name if parent else None,
-            "depth": obj.depth,
-            "persistent": obj.persistent,
-            "visible": obj.visible,
-            "events": [(e.event_type, e.subtype) for e in obj.events],
+            "sprite": sprite or "None",
+            "parent": parent or "None",
+            "depth": getattr(obj, "depth", 0),
+            "persistent": getattr(obj, "persistent", False),
+            "visible": getattr(obj, "visible", True),
+            "events": events[:30],
+            "children": children[:20],
             "placed_in_rooms": placed_in,
-            "states": info.get("states", []),
-            "alive": info.get("alive", False),
-            "created_by": info.get("created_by", []),
-            "ref_sources": info.get("ref_sources", []),
-            "children": info.get("children", []),
-            "incoming_refs": list(incoming)[:20],
-            "outgoing_refs": list(outgoing)[:20],
+            "created_dynamically_by": created_by,
+            "incoming_refs": [f"{e.get('name', '?')} ({e.get('relation', '?')})" for e in inc[:15]],
+            "outgoing_refs": [f"{e.get('name', '?')} ({e.get('relation', '?')})" for e in out[:15]],
+            "in_degree": self.graph.G.in_degree(node),
+            "out_degree": self.graph.G.out_degree(node),
         }
 
-    def trace(self, pattern: str, on_progress: ProgressCB = None) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        lower = pattern.lower()
-
-        self.object_analyzer.analyze()
-        phases = [
-            ("objects", len(self.game.objects)),
-            ("rooms", len(self.game.rooms)),
-            ("sprites", len(self.game.sprites)),
-            ("sounds", len(self.game.sounds)),
-            ("scripts", len(self.game.scripts)),
-            ("strings", len(self.game.strings)),
-        ]
-        total_weight = sum(w for _, w in phases)
-        completed = 0
-
-        def _report(msg):
-            nonlocal completed
-            if on_progress:
-                completed += 1
-                on_progress(completed, total_weight, msg)
-
-        matched_objs = 0
-        for obj_id, obj in self.game.objects.items():
-            if lower not in obj.name.lower():
-                continue
-            matched_objs += 1
-            info = self.object_analyzer.object_analysis(obj.name)
-            chain: list[str] = info.get("ref_sources", [])[:5]
-            created_by = info.get("created_by", [])
-            chain.extend(created_by[:3])
-            summary = "; ".join(chain) if chain else obj.event_summary() if obj.has_any_event else "No events"
-            results.append({
-                "type": "OBJECT", "name": obj.name,
-                "summary": summary,
-                "alive": info.get("alive", False),
-                "states": info.get("states", []),
-                "sprite": info.get("sprite"),
-                "parent": info.get("parent"),
-                "children": info.get("children", [])[:5],
-            })
-        _report(f"{matched_objs} objects matched")
-
-        matched_rooms = 0
-        for room_id, room in self.game.rooms.items():
-            if lower not in room.name.lower():
-                continue
-            matched_rooms += 1
-            reachable = room.id not in self.graph.unreachable_rooms()
-            summary = f"{room.width}x{room.height}, {len(room.instances)} instances"
-            if not reachable:
-                summary += " [UNREACHABLE]"
-            results.append({
-                "type": "ROOM", "name": room.name,
-                "summary": summary,
-                "reachable": reachable,
-                "instance_count": len(room.instances),
-            })
-        _report(f"{matched_rooms} rooms matched")
-
-        matched_sprites = 0
-        for sprite in self.game.sprites.values():
-            if lower not in sprite.name.lower():
-                continue
-            matched_sprites += 1
-            users = [o.name for o in self.game.objects.values() if o.sprite_index == sprite.id]
-            summary = f"Used by {len(users)} objects"
-            if users:
-                summary += f": {', '.join(users[:8])}"
-            results.append({
-                "type": "SPRITE", "name": sprite.name,
-                "summary": summary,
-                "users": users[:10],
-            })
-        _report(f"{matched_sprites} sprites matched")
-
-        for sound in self.game.sounds.values():
-            if lower in sound.name.lower():
-                results.append({"type": "SOUND", "name": sound.name})
-        _report("sounds done")
-
-        matched_scripts = 0
-        for name in self.game.scripts:
-            if lower not in name.lower():
-                continue
-            matched_scripts += 1
-            func_name = f"gml_Script_{name}"
-            callers = []
-            for cid, callees in self.resolver.callees.items():
-                for callee_id in callees:
-                    entry = self.game.code_entries.get(callee_id)
-                    if entry and entry.name == func_name:
-                        owner = self.resolver.owner_of(cid)
-                        if owner:
-                            callers.append(owner)
-            summary = f"Called by {len(callers)} locations"
-            if callers:
-                summary += f": {', '.join(callers[:5])}"
-            results.append({
-                "type": "SCRIPT", "name": name,
-                "summary": summary,
-                "callers": callers[:10],
-            })
-        _report(f"{matched_scripts} scripts matched")
-
-        matched_strs = 0
-        for str_id, s in enumerate(self.game.strings):
-            if lower not in s.lower():
-                continue
-            matched_strs += 1
-            refs = self.resolver.string_refs.get(str_id, [])
-            owners = set()
-            for cid in refs:
-                owner = self.resolver.owner_of(cid)
-                if owner:
-                    owners.add(owner)
-            summary = f"Referenced by {len(refs)} code entries"
-            if owners:
-                summary += f": {', '.join(list(owners)[:5])}"
-            results.append({
-                "type": "STRING", "id": str_id,
-                "name": s[:120],
-                "summary": summary,
-                "ref_count": len(refs),
-            })
-        _report(f"{matched_strs} strings matched")
-
-        return results[:100]
-
-    def who_uses(self, resource_name: str, on_progress: ProgressCB = None) -> dict[str, list[str]]:
-        result: dict[str, list[str]] = {
-            "objects": [],
-            "scripts": [],
-            "rooms": [],
-            "bytecode": [],
-            "events": [],
-            "creation_code": [],
-            "dialogue": [],
-        }
-
-        if on_progress:
-            on_progress(0, 4, "Finding resource by type")
-        sprite = next((s for s in self.game.sprites.values() if s.name == resource_name), None)
-        sound = next((s for s in self.game.sounds.values() if s.name == resource_name), None)
-        room = next((r for r in self.game.rooms.values() if r.name == resource_name), None)
-        obj = next((o for o in self.game.objects.values() if o.name == resource_name), None)
-
-        if sprite:
-            if on_progress:
-                on_progress(1, 4, "Checking sprite references")
-            for o in self.game.objects.values():
-                if o.sprite_index == sprite.id:
-                    result["objects"].append(o.name)
-
-        if sound:
-            if on_progress:
-                on_progress(2, 4, "Scanning bytecode for sound refs")
-            for code_id, entry in self.game.code_entries.items():
-                for instr in entry.instructions:
-                    if instr.opcode == Opcode.PUSHSTR and instr.value_str_id >= 0:
-                        s = self.game.string(instr.value_str_id)
-                        if s == resource_name:
-                            for func_id, _, _ in entry.calls:
-                                fname = self.game.func_names[func_id] if func_id < len(self.game.func_names) else ""
-                                if "audio_play" in fname.lower():
-                                    owner = self.resolver.owner_of(code_id)
-                                    if owner:
-                                        result["bytecode"].append(
-                                            f"{owner} (audio_play_sound)"
-                                        )
-                                    break
-
-        if room:
-            if on_progress:
-                on_progress(2, 4, "Scanning bytecode for room refs")
-            for code_id, entry in self.game.code_entries.items():
-                for instr in entry.instructions:
-                    if instr.opcode == Opcode.PUSHSTR and instr.value_str_id >= 0:
-                        if self.game.string(instr.value_str_id) == resource_name:
-                            owner = self.resolver.owner_of(code_id)
-                            if owner:
-                                result["bytecode"].append(f"{owner} (room_goto)")
-
-            if self.graph.room.has_node(room.id):
-                for pred in self.graph.room.predecessors(room.id):
-                    r = self.game.room_by_id(pred)
-                    if r:
-                        result["rooms"].append(r.name)
-
-        if obj:
-            if on_progress:
-                on_progress(3, 4, "Analyzing object references")
-            self.object_analyzer.analyze(progress_callback=on_progress)
-            rs = self.object_analyzer.object_analysis(obj.name)
-            for src in rs.get("ref_sources", []):
-                if src.startswith("bytecode:"):
-                    result["bytecode"].append(src)
-                elif src.startswith("room:"):
-                    result["rooms"].append(src.replace("room:", ""))
-                elif src.startswith("collision event in "):
-                    result["events"].append(src.replace("collision event in ", ""))
-                elif src.startswith("inst_cc:") or src.startswith("room_cc:"):
-                    result["creation_code"].append(src)
-                else:
-                    result["bytecode"].append(src)
-
-            for c in rs.get("children", []):
-                result["objects"].append(c)
-
-            parent = rs.get("parent")
-            if parent:
-                result["objects"].append(f"PARENT({parent})")
-
-        for key in result:
-            result[key] = list(set(result[key]))[:30]
-
-        if on_progress:
-            on_progress(4, 4, "Done")
-        return result
-
-    def who_writes_flag(self, flag_idx: int) -> list[str]:
-        writers = self.resolver.flag_writes.get(flag_idx, [])
-        return [self.resolver.owner_of(cid) or f"code_{cid}" for cid in writers]
+    # ── ROOM ─────────────────────────────────────────────────────────
 
     def show_room(self, name: str) -> dict[str, Any]:
         room = next((r for r in self.game.rooms.values() if r.name == name), None)
         if not room:
             return {"error": f"Room '{name}' not found"}
 
-        instances_info: list[dict] = []
-        for inst in room.instances:
-            obj = self.game.object_by_id(inst.object_id)
-            instances_info.append({
-                "object": obj.name if obj else f"<obj_{inst.object_id}>",
-                "x": inst.x, "y": inst.y,
-                "instance_id": inst.instance_id,
-                "has_creation_code": inst.creation_code_id >= 0,
-            })
+        node = f"room_{room.id}"
+        inc = self.graph.incoming(node)
+        out = self.graph.outgoing(node)
 
-        incoming = []
-        if self.graph.room.has_node(room.id):
-            incoming = [str(self.game.room_by_id(p).name if self.game.room_by_id(p) else p)
-                        for p in self.graph.room.predecessors(room.id)]
-        outgoing = []
-        if self.graph.room.has_node(room.id):
-            outgoing = [str(self.game.room_by_id(s).name if self.game.room_by_id(s) else s)
-                        for s in self.graph.room.successors(room.id)]
+        instances_info = []
+        for e in out:
+            if e["relation"] == CONTAINS and e["type"] == NT_INSTANCE:
+                inst_node = e["target"]
+                obj_edges = self.graph.outgoing(inst_node, IS_INSTANCE_OF)
+                obj_name = obj_edges[0]["name"] if obj_edges else "?"
+                cc_edges = self.graph.outgoing(inst_node, HAS_CREATION_CODE)
+                instances_info.append({
+                    "object": obj_name,
+                    "instance_id": self.graph.G.nodes[inst_node].get("id"),
+                    "x": self.graph.G.nodes[inst_node].get("x", 0),
+                    "y": self.graph.G.nodes[inst_node].get("y", 0),
+                    "has_creation_code": len(cc_edges) > 0,
+                })
+
+        incoming_names = [
+            f"{e['name']} ({e['relation']})" for e in inc[:20]
+        ]
+        outgoing_names = [
+            f"{e['name']} ({e['relation']})" for e in out[:20] if e["type"] != NT_INSTANCE
+        ]
 
         return {
             "name": room.name,
@@ -333,26 +184,67 @@ class QueryEngine:
             "background_count": len(room.backgrounds),
             "has_creation_code": room.creation_code_id >= 0,
             "reachable": room.id not in self.graph.unreachable_rooms(),
-            "incoming_transitions": incoming[:20],
-            "outgoing_transitions": outgoing[:20],
+            "incoming_transitions": incoming_names,
+            "outgoing_transitions": outgoing_names,
         }
 
+    # ── FLAG ─────────────────────────────────────────────────────────
+
+    def who_writes_flag(self, flag_idx: int) -> list[str]:
+        """Find code that writes to a flag via graph edges."""
+        flag_node = f"flag_{flag_idx}"
+        writers = self.graph.incoming(flag_node, WRITES_FLAG)
+        readers = self.graph.incoming(flag_node, READS_FLAG)
+        result = [
+            f"{e['name']} ({e['source']}) — writes"
+            for e in writers
+        ] + [
+            f"{e['name']} ({e['source']}) — reads"
+            for e in readers
+        ]
+        return result[:30]
+
+    # ── UNREACHABLE ──────────────────────────────────────────────────
+
     def unreachable_rooms(self) -> list[str]:
-        return sorted(self.game.room_by_id(rid).name
-                      for rid in self.graph.unreachable_rooms()
-                      if self.game.room_by_id(rid))
+        return sorted(
+            self.game.room_by_id(rid).name
+            for rid in self.graph.unreachable_rooms()
+            if self.game.room_by_id(rid)
+        )
 
     def unreachable_dialogue(self, on_progress: ProgressCB = None) -> list[tuple[str, str]]:
-        self.dialogue_analyzer.analyze(progress_callback=on_progress)
-        return [(f"str[{sid}]", text[:80])
-                for sid, text in self.dialogue_analyzer.unused_dialogue()[:200]]
+        """Find strings not referenced by any code entry, via the graph."""
+        results = []
+        for nid, data in self.graph.G.nodes(data=True):
+            if data.get("type") != NT_STRING:
+                continue
+            str_id = data.get("id", -1)
+            if str_id < 0:
+                continue
+            inc = self.graph.incoming(nid, REFERENCES)
+            if not inc:
+                text = data.get("name", "")
+                results.append((f"str[{str_id}]", text[:80]))
+        self._done(on_progress, f"Found {len(results)} unused strings")
+        return results[:200]
 
     def dead_objects(self, on_progress: ProgressCB = None) -> list[str]:
-        self.object_analyzer.analyze(progress_callback=on_progress)
-        return sorted(self.object_analyzer.dead_objects())
+        """Objects with no path from any runtime root, via the graph."""
+        dead = self.graph.dead_resources()
+        result = sorted(dead.get(NT_OBJECT, []))
+        self._done(on_progress, f"Found {len(result)} dead objects")
+        return result
+
+    # ── SECRET ───────────────────────────────────────────────────────
 
     def hidden_resources(self, on_progress: ProgressCB = None) -> list[SuspiciousItem]:
-        return self.secret_finder.find_all(progress_callback=on_progress)
+        """Find suspicious resources via graph property inspection."""
+        items = self.graph.suspicious_resources()
+        self._done(on_progress, f"Found {len(items)} suspicious items")
+        return items
+
+    # ── SEARCH ───────────────────────────────────────────────────────
 
     def search(self, pattern: str, on_progress: ProgressCB = None) -> list[dict[str, Any]]:
         return self.trace(pattern, on_progress=on_progress)

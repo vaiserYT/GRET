@@ -55,8 +55,8 @@ def cmd_index(game_path: Path) -> None:
 
 def cmd_analyze(game_path: Path) -> None:
     game, graph, engine = cmd_load(game_path)
-    with _progress_bar("Running full analysis...") as progress:
-        task = progress.add_task("Analyzing objects...", total=8)
+    with _progress_bar("Inspecting semantic graph...") as progress:
+        task = progress.add_task("Inspecting semantic graph...", total=1)
         def cb(c, t, msg):
             progress.update(task, completed=c, total=t, description=msg)
         secrets = engine.hidden_resources(on_progress=cb)
@@ -84,8 +84,8 @@ def cmd_why_object(args: list[str], game, graph, engine) -> None:
         console.print("[red]Usage: why <object_name>[/]")
         return
     name = args[0]
-    with _progress_bar("Analyzing object usage...") as progress:
-        task = progress.add_task("Analyzing runtime usage...", total=11)
+    with _progress_bar("Querying semantic graph...") as progress:
+        task = progress.add_task("Querying semantic graph...", total=1)
         def cb(c, t, msg):
             progress.update(task, completed=c, total=t, description=msg)
         info = engine.why_object(name, on_progress=cb)
@@ -127,8 +127,8 @@ def cmd_trace(args: list[str], game, graph, engine) -> None:
     if not args:
         console.print("[red]Usage: trace <pattern>[/]")
         return
-    with _progress_bar("Searching all resources...") as progress:
-        task = progress.add_task("Analyzing objects...", total=6)
+    with _progress_bar("Tracing semantic graph...") as progress:
+        task = progress.add_task("Tracing semantic graph...", total=1)
         def cb(c, t, msg):
             progress.update(task, completed=c, total=t, description=msg)
         results = engine.trace(args[0], on_progress=cb)
@@ -148,8 +148,8 @@ def cmd_who_uses(args: list[str], game, graph, engine) -> None:
     if not args:
         console.print("[red]Usage: who_uses <resource_name>[/]")
         return
-    with _progress_bar("Finding references...") as progress:
-        task = progress.add_task("Analyzing...", total=4)
+    with _progress_bar("Querying inverse graph...") as progress:
+        task = progress.add_task("Querying inverse graph...", total=1)
         def cb(c, t, msg):
             progress.update(task, completed=c, total=t, description=msg)
         result = engine.who_uses(args[0], on_progress=cb)
@@ -218,12 +218,10 @@ def cmd_unreachable(game, graph, engine) -> None:
     if len(rooms) > 50:
         console.print(f"  ... and {len(rooms) - 50} more")
 
-    with _progress_bar("Analyzing dialogue...") as progress:
-        task = progress.add_task("Scanning for unused dialogue...", total=None)
+    with _progress_bar("Querying string nodes...") as progress:
+        task = progress.add_task("Querying string nodes...", total=1)
         def cb1(c, t, msg):
-            if task.total is None and t > 0:
-                progress.update(task, total=t)
-            progress.update(task, completed=c, description=msg)
+            progress.update(task, completed=c, total=t, description=msg)
         dialogue = engine.unreachable_dialogue(on_progress=cb1)
     console.print(f"\n[bold yellow]Unused Dialogue ({len(dialogue)}):[/]")
     for sid, text in dialogue[:30]:
@@ -231,8 +229,8 @@ def cmd_unreachable(game, graph, engine) -> None:
     if len(dialogue) > 30:
         console.print(f"  ... and {len(dialogue) - 30} more")
 
-    with _progress_bar("Analyzing dead objects...") as progress:
-        task = progress.add_task("Scanning object usage...", total=11)
+    with _progress_bar("Checking graph reachability...") as progress:
+        task = progress.add_task("Checking graph reachability...", total=1)
         def cb2(c, t, msg):
             progress.update(task, completed=c, total=t, description=msg)
         dead = engine.dead_objects(on_progress=cb2)
@@ -244,8 +242,8 @@ def cmd_unreachable(game, graph, engine) -> None:
 
 
 def cmd_secret(game, graph, engine) -> None:
-    with _progress_bar("Finding hidden resources...") as progress:
-        task = progress.add_task("Analyzing objects...", total=8)
+    with _progress_bar("Inspecting graph properties...") as progress:
+        task = progress.add_task("Inspecting graph properties...", total=1)
         def cb(c, t, msg):
             progress.update(task, completed=c, total=t, description=msg)
         secrets = engine.hidden_resources(on_progress=cb)
@@ -268,8 +266,8 @@ def cmd_search(args: list[str], game, graph, engine) -> None:
     if not args:
         console.print("[red]Usage: search <pattern>[/]")
         return
-    with _progress_bar("Searching...") as progress:
-        task = progress.add_task("Scanning resources...", total=6)
+    with _progress_bar("Searching semantic graph...") as progress:
+        task = progress.add_task("Searching semantic graph...", total=1)
         def cb(c, t, msg):
             progress.update(task, completed=c, total=t, description=msg)
         results = engine.search(args[0], on_progress=cb)
