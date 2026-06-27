@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GameMaker Static Analysis Report - {{ game_name }}</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-card: #161b22;
+    --bg-hover: #1c2333;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-muted: #8b949e;
+    --critical: #ff4444;
+    --very-high: #ff8800;
+    --high: #ffaa00;
+    --medium: #ffdd00;
+    --low: #88ccff;
+    --none: #555;
+    --accent: #58a6ff;
+    --green: #3fb950;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 20px; }
+  .container { max-width: 1400px; margin: 0 auto; }
+  h1 { font-size: 2em; margin-bottom: 5px; color: var(--accent); }
+  h2 { font-size: 1.5em; margin: 30px 0 15px; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  h3 { font-size: 1.2em; margin: 20px 0 10px; color: var(--text-muted); }
+  .subtitle { color: var(--text-muted); margin-bottom: 20px; }
+  .summary-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-bottom: 30px; }
+  .summary-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; text-align: center; }
+  .summary-card .num { font-size: 2em; font-weight: bold; color: var(--accent); }
+  .summary-card .label { font-size: 0.85em; color: var(--text-muted); margin-top: 4px; }
+  .summary-card.danger .num { color: var(--critical); }
+  .summary-card.warn .num { color: var(--very-high); }
+  .suspicious-table { width: 100%; border-collapse: collapse; margin-bottom: 30px; }
+  .suspicious-table th { text-align: left; padding: 10px 12px; background: var(--bg-card); border-bottom: 2px solid var(--border); font-size: 0.85em; text-transform: uppercase; color: var(--text-muted); }
+  .suspicious-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 0.9em; }
+  .suspicious-table tr:hover { background: var(--bg-hover); }
+  .suspicious-table .score { font-weight: bold; font-variant-numeric: tabular-nums; }
+  .score-critical { color: var(--critical); }
+  .score-very-high { color: var(--very-high); }
+  .score-high { color: var(--high); }
+  .score-medium { color: var(--medium); }
+  .score-low { color: var(--low); }
+  .level-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; font-weight: bold; text-transform: uppercase; }
+  .level-CRITICAL { background: var(--critical); color: #000; }
+  .level-VERY_HIGH { background: var(--very-high); color: #000; }
+  .level-HIGH { background: var(--high); color: #000; }
+  .level-MEDIUM { background: var(--medium); color: #000; }
+  .level-LOW { background: var(--low); color: #000; }
+  .type-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; background: var(--bg-hover); border: 1px solid var(--border); }
+  .details-section { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+  .detail-item { margin-bottom: 15px; }
+  .detail-item:last-child { margin-bottom: 0; }
+  .detail-header { font-weight: bold; color: var(--accent); margin-bottom: 5px; }
+  .detail-body { padding-left: 15px; border-left: 2px solid var(--border); }
+  .reasons-list { list-style: none; padding: 0; }
+  .reasons-list li { padding: 3px 0; font-size: 0.9em; }
+  .reasons-list li::before { content: "\\2022"; color: var(--accent); margin-right: 8px; }
+  .explorer-section { margin-bottom: 30px; }
+  .explorer-item { padding: 8px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 4px; margin-bottom: 6px; cursor: pointer; }
+  .explorer-item:hover { background: var(--bg-hover); }
+  .finding-item { padding: 4px 0; font-size: 0.9em; color: var(--text-muted); }
+  .finding-item::before { content: ">"; color: var(--accent); margin-right: 8px; }
+  .stats-row { display: flex; gap: 30px; flex-wrap: wrap; margin-bottom: 10px; }
+  .stat-item { flex: 1; min-width: 120px; }
+  .stat-item .stat-label { font-size: 0.8em; color: var(--text-muted); }
+  .stat-item .stat-value { font-size: 1.1em; color: var(--text); }
+  .graph-container { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; text-align: center; }
+  .graph-container img, .graph-container object { max-width: 100%; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 20px; flex-wrap: wrap; }
+  .tab { padding: 8px 16px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 0.85em; color: var(--text-muted); }
+  .tab:hover { background: var(--bg-hover); color: var(--text); }
+  .tab.active { background: var(--accent); color: #000; border-color: var(--accent); font-weight: bold; }
+  .search-box { padding: 10px 15px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; width: 100%; color: var(--text); font-size: 1em; margin-bottom: 20px; }
+  .search-box:focus { outline: none; border-color: var(--accent); }
+  @media (max-width: 768px) { .summary-grid { grid-template-columns: repeat(2, 1fr); } }
+  .dead-list { display: flex; flex-wrap: wrap; gap: 8px; }
+  .dead-tag { padding: 4px 12px; background: var(--bg-hover); border: 1px solid var(--border); border-radius: 4px; font-size: 0.85em; font-family: monospace; }
+  .dead-tag:hover { background: var(--bg-card); }
+  .flag-table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+  .flag-table th { text-align: left; padding: 8px 12px; background: var(--bg-card); border-bottom: 2px solid var(--border); font-size: 0.85em; color: var(--text-muted); }
+  .flag-table td { padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 0.9em; font-family: monospace; }
+  .flag-table tr:hover { background: var(--bg-hover); }
+  .flag-never-set { color: var(--critical); }
+  .flag-never-read { color: var(--very-high); }
+  .flag-ok { color: var(--green); }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>GameMaker Static Analysis Report</h1>
+  <p class="subtitle">{{ game_name }} &mdash; Generated {{ generated_at }}</p>
+
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('summary')">Summary</div>
+    <div class="tab" onclick="showTab('suspicious')">Top {{ top_limit }} Suspicious</div>
+    <div class="tab" onclick="showTab('dead')">Dead Resources</div>
+    <div class="tab" onclick="showTab('flags')">Flags</div>
+    <div class="tab" onclick="showTab('plot')">Plot Branches</div>
+    <div class="tab" onclick="showTab('explorer')">Explorer</div>
+  </div>
+
+  <div id="tab-summary" class="tab-content">
+    <div class="summary-grid">
+      <div class="summary-card"><div class="num">{{ total_objects }}</div><div class="label">Objects</div></div>
+      <div class="summary-card"><div class="num">{{ total_rooms }}</div><div class="label">Rooms</div></div>
+      <div class="summary-card"><div class="num">{{ total_scripts }}</div><div class="label">Scripts</div></div>
+      <div class="summary-card"><div class="num">{{ total_sprites }}</div><div class="label">Sprites</div></div>
+      <div class="summary-card"><div class="num">{{ total_sounds }}</div><div class="label">Sounds</div></div>
+      <div class="summary-card"><div class="num">{{ total_dialogues }}</div><div class="label">Dialogues</div></div>
+      <div class="summary-card"><div class="num">{{ total_flags }}</div><div class="label">Flags</div></div>
+      <div class="summary-card danger"><div class="num">{{ dead_objects }}</div><div class="label">Dead Objects</div></div>
+      <div class="summary-card danger"><div class="num">{{ dead_rooms }}</div><div class="label">Dead Rooms</div></div>
+      <div class="summary-card danger"><div class="num">{{ dead_scripts }}</div><div class="label">Dead Scripts</div></div>
+      <div class="summary-card warn"><div class="num">{{ dead_sprites }}</div><div class="label">Dead Sprites</div></div>
+      <div class="summary-card warn"><div class="num">{{ dead_sounds }}</div><div class="label">Dead Sounds</div></div>
+      <div class="summary-card warn"><div class="num">{{ dead_dialogues }}</div><div class="label">Dead Dialogues</div></div>
+      <div class="summary-card"><div class="num">{{ suspicious_total }}</div><div class="label">Suspicious Items</div></div>
+      <div class="summary-card"><div class="num">{{ plot_branches_count }}</div><div class="label">Plot Branches</div></div>
+      <div class="summary-card"><div class="num">{{ orphan_resources }}</div><div class="label">Orphan Resources</div></div>
+    </div>
+
+    <h2>Resource Overview</h2>
+    <div class="details-section">
+      <div class="stats-row">
+        <div class="stat-item"><div class="stat-label">Project Path</div><div class="stat-value">{{ project_path }}</div></div>
+        <div class="stat-item"><div class="stat-label">Total Resources</div><div class="stat-value">{{ total_resources }}</div></div>
+        <div class="stat-item"><div class="stat-label">Findings</div><div class="stat-value">{{ findings_total }}</div></div>
+      </div>
+    </div>
+
+    <h2>Flag Analysis</h2>
+    <div class="summary-grid">
+      <div class="summary-card warn"><div class="num">{{ flag_never_set }}</div><div class="label">Flags Never Set</div></div>
+      <div class="summary-card danger"><div class="num">{{ flag_never_read }}</div><div class="label">Flags Never Read</div></div>
+      <div class="summary-card warn"><div class="num">{{ flag_read_before_write }}</div><div class="label">Read Before Write</div></div>
+      <div class="summary-card"><div class="num">{{ flag_write_without_read }}</div><div class="label">Write Without Read</div></div>
+    </div>
+  </div>
+
+  <div id="tab-suspicious" class="tab-content" style="display:none">
+    <h2>Top {{ top_limit }} Suspicious Resources</h2>
+    <input type="text" class="search-box" placeholder="Filter suspicious items..." oninput="filterTable('suspicious-table', this.value)">
+    <table class="suspicious-table" id="suspicious-table">
+      <thead>
+        <tr><th>Score</th><th>Level</th><th>Name</th><th>Type</th><th>Reasons</th></tr>
+      </thead>
+      <tbody>
+        {% for item in suspicious_items %}
+        <tr>
+          <td class="score score-{{ item.level.name.lower() }}">{{ item.score }}</td>
+          <td><span class="level-badge level-{{ item.level.name }}">{{ item.level.name }}</span></td>
+          <td><code>{{ item.name }}</code></td>
+          <td><span class="type-badge">{{ item.resource_type.name }}</span></td>
+          <td><ul class="reasons-list">{% for reason in item.reasons %}<li>{{ reason }}</li>{% endfor %}</ul></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div id="tab-dead" class="tab-content" style="display:none">
+    <h2>Dead Resources</h2>
+
+    <h3>Dead Objects ({{ dead_objects_list|length }})</h3>
+    <div class="dead-list">{% for obj in dead_objects_list %}<span class="dead-tag">{{ obj }}</span>{% endfor %}</div>
+
+    <h3>Dead Rooms ({{ dead_rooms_list|length }})</h3>
+    <div class="dead-list">{% for room in dead_rooms_list %}<span class="dead-tag">{{ room }}</span>{% endfor %}</div>
+
+    <h3>Dead Scripts ({{ dead_scripts_list|length }})</h3>
+    <div class="dead-list">{% for scr in dead_scripts_list %}<span class="dead-tag">{{ scr }}</span>{% endfor %}</div>
+
+    <h3>Dead Sprites ({{ dead_sprites_list|length }})</h3>
+    <div class="dead-list">{% for spr in dead_sprites_list %}<span class="dead-tag">{{ spr }}</span>{% endfor %}</div>
+
+    <h3>Dead Sounds ({{ dead_sounds_list|length }})</h3>
+    <div class="dead-list">{% for snd in dead_sounds_list %}<span class="dead-tag">{{ snd }}</span>{% endfor %}</div>
+
+    <h3>Dead Dialogues ({{ dead_dialogues_list|length }})</h3>
+    <div class="dead-list">{% for dia in dead_dialogues_list %}<span class="dead-tag">{{ dia }}</span>{% endfor %}</div>
+  </div>
+
+  <div id="tab-flags" class="tab-content" style="display:none">
+    <h2>Flag Analysis</h2>
+    <input type="text" class="search-box" placeholder="Filter flags..." oninput="filterTable('flag-table', this.value)">
+
+    <h3>Flags Never Set ({{ flag_never_set_details|length }})</h3>
+    <table class="flag-table" id="flag-table-never-set">
+      <thead><tr><th>Flag</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for flag in flag_never_set_details %}
+        <tr><td class="flag-never-set">flag[{{ flag }}]</td><td>Never set</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>Flags Never Read ({{ flag_never_read_details|length }})</h3>
+    <table class="flag-table">
+      <thead><tr><th>Flag</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for flag in flag_never_read_details %}
+        <tr><td class="flag-never-read">flag[{{ flag }}]</td><td>Never read</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>Flags Write Without Read ({{ flag_write_without_read_details|length }})</h3>
+    <table class="flag-table">
+      <thead><tr><th>Flag</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for flag in flag_write_without_read_details %}
+        <tr><td class="flag-never-read">flag[{{ flag }}]</td><td>Set but never read</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div id="tab-plot" class="tab-content" style="display:none">
+    <h2>Plot Branches</h2>
+    <table class="suspicious-table">
+      <thead>
+        <tr><th>Plot State</th><th>Reachable</th><th>Has Code</th><th>Incoming</th><th>Outgoing</th><th>References</th></tr>
+      </thead>
+      <tbody>
+        {% for pv, branch in plot_branches %}
+        <tr>
+          <td><code>global.plot == {{ pv }}</code></td>
+          <td>{{ "Yes" if branch.reachable else "<span style='color:var(--critical)'>No</span>" }}</td>
+          <td>{{ "Yes" if branch.has_code else "<span style='color:var(--critical)'>No</span>" }}</td>
+          <td>{{ branch.incoming_states|length }}</td>
+          <td>{{ branch.outgoing_states|length }}</td>
+          <td>{{ branch.references|length }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div id="tab-explorer" class="tab-content" style="display:none">
+    <h2>Resource Explorer</h2>
+    <input type="text" class="search-box" placeholder="Search resources..." oninput="filterExplorer(this.value)">
+    <div id="explorer-list">
+      {% for res_type, resources in explorer %}
+      <h3>{{ res_type }}</h3>
+      {% for res in resources %}
+      <div class="explorer-item explorer-resource">{{ res }}</div>
+      {% endfor %}
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<script>
+function showTab(tabName) {
+  document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + tabName).style.display = '';
+  const tab = document.querySelector(`.tab[onclick="showTab('${tabName}')"]`);
+  if (tab) tab.classList.add('active');
+}
+
+function filterTable(tableId, query) {
+  const table = document.getElementById(tableId);
+  if (!table) return;
+  const rows = table.querySelectorAll('tbody tr');
+  const q = query.toLowerCase();
+  rows.forEach(row => {
+    const text = row.textContent.toLowerCase();
+    row.style.display = text.includes(q) ? '' : 'none';
+  });
+}
+
+function filterExplorer(query) {
+  const q = query.toLowerCase();
+  document.querySelectorAll('.explorer-resource').forEach(el => {
+    el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>
